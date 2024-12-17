@@ -1,0 +1,70 @@
+<?php
+require_once '../db/db.php';
+require_once '../functions/user_helpers.php';
+
+function sendEmailNotification($to_email, $subject, $message) {
+    $headers = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-type:text/html;charset=UTF-8\r\n";
+    $headers .= "From: GameLink <no-reply@gamelink.com>\r\n";
+    
+    return mail($to_email, $subject, $message, $headers);
+}
+
+function getEmailTemplate($content) {
+    return '
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body { font-family: Arial, sans-serif; }
+            .container { padding: 20px; max-width: 600px; margin: 0 auto; }
+            .header { background: #4834d4; color: white; padding: 20px; text-align: center; }
+            .content { padding: 20px; background: #f8f9fa; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>GameLink Notification</h1>
+            </div>
+            <div class="content">
+                ' . $content . '
+            </div>
+        </div>
+    </body>
+    </html>';
+}
+
+function sendTradeNotification($conn, $user_id, $user_email, $game_id, $type, $data) {
+    if (!filter_var($user_email, FILTER_VALIDATE_EMAIL)) {
+        error_log("Invalid email address: {$user_email}");
+        return false;
+    }
+
+    $subject = "";
+    $content = "";
+    
+    switch ($type) {
+        case 'new_request':
+            $subject = "New Game Trade Request";
+            $content = "<p>Hello,</p>
+                       <p>{$data['requester_name']} would like to borrow/trade your game:</p>
+                       <p><strong>{$data['game_title']}</strong></p>
+                       <p>Login to respond to this request.</p>";
+            break;
+            
+        case 'request_approved':
+            $subject = "Game Request Approved";
+            $content = "<p>Good news! Your request for {$data['game_title']} was approved.</p>";
+            break;
+            
+        case 'request_declined':
+            $subject = "Game Request Update";
+            $content = "<p>Your request for {$data['game_title']} was not approved.</p>";
+            break;
+    }
+
+    $message = getEmailTemplate($content);
+    return sendEmailNotification($user_email, $subject, $message);
+}
+?>
