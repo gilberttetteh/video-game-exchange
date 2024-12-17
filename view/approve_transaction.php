@@ -34,6 +34,7 @@ $trades = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 <html>
 <head>
     <title>Approve Trade Requests</title>
+    <link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
     <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
     <link rel="stylesheet" href="../assets/css/styles.css">
     <style>

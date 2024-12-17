@@ -121,6 +121,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 ?>
 
 <!DOCTYPE html>
+<link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
 <html>
 <head>
     <title>Trade or Borrow Game</title>

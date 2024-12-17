@@ -3,43 +3,187 @@ ini_set('display_errors', 0);
 ini_set('display_startup_errors', 0);
 session_start();
 
-// Include necessary files
 $requiredFiles = [
     '../db/db.php',
-    '../functions/email_notifications.php',
-    '../functions/user_helpers.php'
+    '../functions/user_helpers.php',
+    '../functions/email_notifications.php'
 ];
 
 foreach ($requiredFiles as $file) {
     require_once $file;
 }
 
-// Security: Check if user is logged in
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
     http_response_code(403);
     echo json_encode(['error' => 'Unauthorized access']);
     exit;
 }
 
+class GameExchangeChatbot {
+    private $connection;
+    private $user_id;
 
-// Main request handler
-function handleGameExchangeRequest($connection, $user_id) {
-    ob_clean();
-    header('Content-Type: application/json');
+    public function __construct($connection, $user_id) {
+        $this->connection = $connection;
+        $this->user_id = $user_id;
+    }
+
+    private function getUserName() {
+        $query = "SELECT username FROM game_users WHERE user_id = ?";
+        $stmt = $this->connection->prepare($query);
+        $stmt->bind_param("i", $this->user_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        return ($row = $result->fetch_assoc()) ? $row['username'] : "User";
+    }
+
+    private function sendEmail($to_email, $subject, $message) {
+        $headers = "MIME-Version: 1.0\r\n";
+        $headers .= "Content-type:text/html;charset=UTF-8\r\n";
+        $headers .= "From: GameLink <no-reply@gamelink.com>\r\n";
+        
+        return mail($to_email, $subject, $message, $headers);
+    }
+
+    private function getEmailTemplate($content) {
+        return '
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; }
+                .container { padding: 20px; max-width: 600px; margin: 0 auto; }
+                .header { background: #4834d4; color: white; padding: 20px; text-align: center; }
+                .content { padding: 20px; background: #f8f9fa; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>GameLink Notification</h1>
+                </div>
+                <div class="content">
+                    ' . $content . '
+                </div>
+            </div>
+        </body>
+        </html>';
+    }
+
+    public function getBorrowableGames() {
+
+$query = "SELECT g.game_id, g.title, u.username, u.email, u.user_id as owner_id 
+          FROM game_games g
+          JOIN game_users u ON g.user_id = u.user_id
+          WHERE g.user_id != ? AND g.game_id != 99999";
+        $stmt = $this->connection->prepare($query);
+        $stmt->bind_param("i", $this->user_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $games = [];
+        $gameMap = [];
+        
+        while ($row = $result->fetch_assoc()) {
+            $title = $row['title'] . " (Owner: " . $row['username'] . ")";
+            $games[] = $title;
+            $gameMap[$title] = [
+                'id' => $row['game_id'],
+                'email' => $row['email'],
+                'owner_id' => $row['owner_id']
+            ];
+        }
+        error_log('Number of borrowable games found: ' . count($games));
+
+        return [
+            'games' => $games,
+            'gameMap' => $gameMap
+        ];
+    }
+
+    public function getUserGamesForExchange() {
+        $query = "SELECT game_id, title FROM game_games WHERE user_id = ? AND game_id != 99999";
+        $stmt = $this->connection->prepare($query);
+        $stmt->bind_param("i", $this->user_id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $games = [];
+        $gameMap = [];
+        
+        while ($row = $result->fetch_assoc()) {
+            $games[] = $row['title'];
+            $gameMap[$row['title']] = $row['game_id'];
+        }
+
+        return [
+            'games' => $games,
+            'gameMap' => $gameMap
+        ];
+    }
+
+    public function processBorrowRequest($selected_game, $gameMap) {
+        // Debugging output
+        error_log("Selected game: " . $selected_game);
+        error_log("Game map keys: " . implode(", ", array_keys($gameMap)));
     
-    try {
-        $request = json_decode(file_get_contents('php://input'), true);
+        if (!isset($gameMap[$selected_game])) {
+            return ['message' => 'Invalid game selection.'];
+        }
+    
+        $game_data = $gameMap[$selected_game];
+        $this->connection->begin_transaction();
+    
+        try {
+            $insert_query = "INSERT INTO game_requests 
+                           (borrower_id, lender_id, game_id, requested_game_id, request_type, status, request_date) 
+                           VALUES (?, ?, ?, ?, 'borrow', 'pending', NOW())";
+            $stmt = $this->connection->prepare($insert_query);
+            $stmt->bind_param("iiii", $this->user_id, $game_data['owner_id'], $game_data['id'], $game_data['id']);
+            $stmt->execute();
+    
+            $content = "<h2>New Game Request</h2>
+                       <p>Hello,</p>
+                       <p>" . $this->getUserName() . " would like to borrow your game:</p>
+                       <p><strong>" . htmlspecialchars(explode(" (Owner:", $selected_game)[0]) . "</strong></p>
+                       <p>Please login to respond to this request.</p>";
+            
+            $message = $this->getEmailTemplate($content);
+            $subject = "New Game Request - GameLink";
+            
+            $sent = $this->sendEmail($game_data['email'], $subject, $message);
+    
+            if ($sent) {
+                $log_query = "INSERT INTO game_emails (user_id, game_id, email_subject, email_body, recipient_email, status, sent_at, created_at, error_message) 
+                             VALUES (?, ?, ?, ?, ?, 'sent', NOW(), NOW(), 'none')";
+                $stmt = $this->connection->prepare($log_query);
+                $stmt->bind_param("iisss", $game_data['owner_id'], $game_data['id'], $subject, $message, $game_data['email']);
+                $stmt->execute();
+            }
+    
+            $this->connection->commit();
+            return ['message' => "Borrow request sent successfully!"];
+    
+        } catch (Exception $e) {
+            $this->connection->rollback();
+            error_log("Borrow request error: " . $e->getMessage());
+            return ["Request failed"];
+        }
+    }
+
+    public function handleRequest($request) {
         $action = $request['action'] ?? null;
         $selected_game = $request['selected_game'] ?? null;
+
+        if (!isset($_SESSION['chat_state'])) {
+            $_SESSION['chat_state'] = "start";
+        }
 
         $response = [
             "message" => "",
             "options" => []
         ];
-
-        if (!isset($_SESSION['chat_state'])) {
-            $_SESSION['chat_state'] = "start";
-        }
 
         switch ($_SESSION['chat_state']) {
             case "start":
@@ -50,24 +194,47 @@ function handleGameExchangeRequest($connection, $user_id) {
 
             case "select_action":
                 if ($action === "Borrow") {
-                    $response = handleBorrowAction($connection, $user_id);
+                    $borrowable_games = $this->getBorrowableGames();
+                    if (!empty($borrowable_games['games'])) {
+                        $response['message'] = "Here are available games for borrowing:";
+                        $response['options'] = $borrowable_games['games'];
+                        $_SESSION['game_map'] = $borrowable_games['gameMap'];
+                        $_SESSION['chat_state'] = "borrow_game";
+                    } else {
+                        $response['message'] = "Sorry, no games are currently available for borrowing.";
+                        $_SESSION['chat_state'] = "start";
+                    }
                 } elseif ($action === "Exchange") {
-                    $response = handleExchangeAction($connection, $user_id);
-                } else {
-                    $response['message'] = "Please choose a valid option.";
+                    $user_games = $this->getUserGamesForExchange();
+                    if (!empty($user_games['games'])) {
+                        $response['message'] = "Select a game you want to offer for exchange:";
+                        $response['options'] = $user_games['games'];
+                        $_SESSION['offered_game_map'] = $user_games['gameMap'];
+                        $_SESSION['chat_state'] = "select_offered_game";
+                    } else {
+                        $response['message'] = "You don't have any games to offer for exchange.";
+                        $_SESSION['chat_state'] = "start";
+                    }
                 }
                 break;
 
             case "borrow_game":
-                $response = processBorrowRequest($connection, $user_id, $selected_game);
+                $response = $this->processBorrowRequest($selected_game, $_SESSION['game_map']);
+                $_SESSION['chat_state'] = "start";
                 break;
 
             case "select_offered_game":
-                $response = handleOfferedGameSelection($connection, $user_id, $selected_game);
-                break;
-
-            case "select_requested_game":
-                $response = processExchangeRequest($connection, $user_id, $selected_game);
+                $borrowable_games = $this->getBorrowableGames();
+                if (!empty($borrowable_games['games'])) {
+                    $response['message'] = "Select a game you want to receive:";
+                    $response['options'] = $borrowable_games['games'];
+                    $_SESSION['requested_game_map'] = $borrowable_games['gameMap'];
+                    $_SESSION['offered_game'] = $selected_game;
+                    $_SESSION['chat_state'] = "select_requested_game";
+                } else {
+                    $response['message'] = "Sorry, no games are currently available for exchange.";
+                    $_SESSION['chat_state'] = "start";
+                }
                 break;
 
             default:
@@ -77,288 +244,31 @@ function handleGameExchangeRequest($connection, $user_id) {
         }
 
         return $response;
-
-    } catch (Exception $e) {
-        return [
-            'message' => 'An unexpected error occurred. Please try again.',
-            'error' => true
-        ];
     }
 }
 
-// Helper function to get available games for borrowing
-function handleBorrowAction($connection, $user_id) {
-    $query = "SELECT g.game_id, g.title, u.username, u.email 
-              FROM game_games g
-              JOIN game_users u ON g.user_id = u.user_id
-              WHERE g.user_id != ? AND g.game_id != 99999";
-    $stmt = $connection->prepare($query);
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-
-    $response = [
-        'message' => 'No games available for borrowing.',
-        'options' => []
-    ];
-
-    if ($result->num_rows > 0) {
-        $response['message'] = "Here are the games available for borrowing. Select a game:";
-        $_SESSION['game_map'] = [];
-        
-        while ($row = $result->fetch_assoc()) {
-            $title = $row['title'] . " (Owner: " . $row['username'] . ")";
-            $response['options'][] = $title;
-            $_SESSION['game_map'][$title] = [
-                'id' => $row['game_id'],
-                'email' => $row['email']
-            ];
-        }
-        $_SESSION['chat_state'] = "borrow_game";
-    }
-
-    return $response;
-}
-
-// Helper function to get user's games for exchange
-function handleExchangeAction($connection, $user_id) {
-    $query = "SELECT game_id, title FROM game_games WHERE user_id = ? AND game_id != 99999";
-
-    $stmt = $connection->prepare($query);
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-
-    $response = [
-        'message' => 'You have no games to offer for exchange.',
-        'options' => []
-    ];
-
-    if ($result->num_rows > 0) {
-        $response['message'] = "Select a game you want to offer for exchange:";
-        $_SESSION['game_map'] = [];
-        
-        while ($row = $result->fetch_assoc()) {
-            $response['options'][] = $row['title'];
-            $_SESSION['game_map'][$row['title']] = $row['game_id'];
-        }
-        $_SESSION['chat_state'] = "select_offered_game";
-    }
-
-    return $response;
-}
-
-// Process borrowing a game
-function processBorrowRequest($connection, $user_id, $selected_game) {
-    $response = [
-        'message' => 'Game selection failed.',
-        'options' => []
-    ];
-
-    if ($selected_game && isset($_SESSION['game_map'][$selected_game])) {
-        $game_data = $_SESSION['game_map'][$selected_game];
-        $game_id = $game_data['id'];
-
-        // Validate game ID to prevent placeholder
-        if ($game_id == 99999) {
-            $response['message'] = "Invalid game selection.";
-            return $response;
-        }
-
-        $connection->begin_transaction();
-        try {
-            // Get lender's ID
-            $query = "SELECT user_id FROM game_games WHERE game_id = ? AND game_id != 99999";
-            $stmt = $connection->prepare($query);
-            $stmt->bind_param("i", $game_id);
-            $stmt->execute();
-            $result = $stmt->get_result();
-
-            if ($row = $result->fetch_assoc()) {
-                $lender_id = $row['user_id'];
-
-                // Validate game ID again before insertion
-                if ($game_id == 99999) {
-                    throw new Exception("Invalid game selection");
-                }
-
-                // Insert borrow request
-                $insert_query = "INSERT INTO game_requests 
-                                 (borrower_id, lender_id, game_id, request_type, status, request_date) 
-                                 VALUES (?, ?, ?, 'borrow', 'pending', NOW())";
-                $stmt = $connection->prepare($insert_query);
-                $stmt->bind_param("iii", $user_id, $lender_id, $game_id);
-                $stmt->execute();
-
-                $connection->commit();
-                $response['message'] = "Borrow request sent successfully!";
-                $_SESSION['chat_state'] = "start";
-            } else {
-                $response['message'] = "Game not found or unavailable.";
-            }
-        } catch (Exception $e) {
-            $connection->rollback();
-            $response['message'] = "Request failed: " . $e->getMessage();
-        }
-    }
-
-    return $response;
-}
-
-// Handle selecting a game to offer in exchange
-function handleOfferedGameSelection($connection, $user_id, $selected_game) {
-    $response = [
-        'message' => 'Game selection failed.',
-        'options' => []
-    ];
-
-    if ($selected_game && isset($_SESSION['game_map'][$selected_game])) {
-        $offered_game_id = $_SESSION['game_map'][$selected_game];
-        
-        // Validate offered game ID
-        if ($offered_game_id == 99999) {
-            $response['message'] = "Invalid game selection.";
-            return $response;
-        }
-        
-        $_SESSION['offered_game_id'] = $offered_game_id;
-        
-        $query = "SELECT g.game_id, g.title, u.username, u.email 
-                  FROM game_games g
-                  JOIN game_users u ON g.user_id = u.user_id
-                  WHERE g.user_id != ? AND g.game_id != 99999";
-        $stmt = $connection->prepare($query);
-        $stmt->bind_param("i", $user_id);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result->num_rows > 0) {
-            $response['message'] = "Select a game you want to receive:";
-            $_SESSION['game_map'] = [];
-            
-            while ($row = $result->fetch_assoc()) {
-                $title = $row['title'] . " (Owner: " . $row['username'] . ")";
-                $response['options'][] = $title;
-                $_SESSION['game_map'][$title] = [
-                    'id' => $row['game_id'],
-                    'email' => $row['email']
-                ];
-            }
-            $_SESSION['chat_state'] = "select_requested_game";
-        }
-    }
-
-    return $response;
-}
-
-// Process game exchange request
-function processExchangeRequest($connection, $user_id, $selected_game) {
-    $response = [
-        'message' => 'Exchange request failed.',
-        'options' => []
-    ];
-
-    if ($selected_game && 
-        isset($_SESSION['game_map'][$selected_game]) && 
-        isset($_SESSION['offered_game_id'])
-    ) {
-        $game_data = $_SESSION['game_map'][$selected_game];
-        $requested_game_id = $game_data['id'];
-        $offered_game_id = $_SESSION['offered_game_id'];
-        
-        // Validate game IDs to prevent placeholder
-        if ($offered_game_id == 99999 || $requested_game_id == 99999) {
-            $response['message'] = "Invalid game selection.";
-            return $response;
-        }
-
-        $connection->begin_transaction();
-        
-        try {
-            // Verify that both games exist and are valid
-            $verify_query = "SELECT game_id FROM game_games WHERE game_id IN (?, ?) AND game_id != 99999";
-            $verify_stmt = $connection->prepare($verify_query);
-            $verify_stmt->bind_param("ii", $offered_game_id, $requested_game_id);
-            $verify_stmt->execute();
-            $verify_result = $verify_stmt->get_result();
-            
-            if ($verify_result->num_rows != 2) {
-                throw new Exception("Invalid game selection");
-            }
-            
-            // Get the owner of the requested game
-            $owner_query = "SELECT user_id FROM game_games WHERE game_id = ? AND game_id != 99999";
-            $owner_stmt = $connection->prepare($owner_query);
-            $owner_stmt->bind_param("i", $requested_game_id);
-            $owner_stmt->execute();
-            $owner_result = $owner_stmt->get_result();
-            
-            if (!($owner_row = $owner_result->fetch_assoc())) {
-                throw new Exception("Game owner not found");
-            }
-            
-            $lender_id = $owner_row['user_id'];
-            
-            // Insert exchange request
-            $insert_query = "INSERT INTO game_requests 
-                            (borrower_id, lender_id, game_id, requested_game_id, request_type, status, request_date) 
-                            VALUES (?, ?, ?, ?, 'exchange', 'pending', NOW())";
-            
-            $stmt = $connection->prepare($insert_query);
-            $stmt->bind_param("iiii", $user_id, $lender_id, $offered_game_id, $requested_game_id);
-            
-            if (!$stmt->execute()) {
-                throw new Exception("Failed to insert exchange request");
-            }
-            $connection->commit();
-            $response['message'] = "Exchange request sent successfully!";
-            $_SESSION['chat_state'] = "start";
-            
-            
-            
-            // Send email notification
-            $notification_sent = sendEmail(
-                $game_data['email'],
-                "New Game Exchange Request",
-                "Hello,<br><br>A user has requested to exchange games with you.<br>
-                Please log in to review and respond to this request.<br><br>
-                Best regards,<br>Game Exchange Team"
-            );
-            
-            if (!$notification_sent) {
-                throw new Exception("Failed to send email notification");
-            }
-            
-            $connection->commit();
-            $response['message'] = "Exchange request sent successfully! The owner has been notified.";
-            $_SESSION['chat_state'] = "start";
-            
-        } catch (Exception $e) {
-            $connection->rollback();
-            $response['message'] = "Failed to send exchange request: " . $e->getMessage();
-            error_log("Exchange request error: " . $e->getMessage());
-        }
-    }
-
-    return $response;
-}
-
-// Main execution remains the same
+// API Handler Section
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $response = handleGameExchangeRequest($connection, $_SESSION['user_id']);
+    header('Content-Type: application/json');
+    $request = json_decode(file_get_contents('php://input'), true);
+    $chatbot = new GameExchangeChatbot($connection, $_SESSION['user_id']);
+    $response = $chatbot->handleRequest($request);
     echo json_encode($response);
     exit;
 }
-?>
 
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Game Exchange Chatbot</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
+// Only output HTML for GET requests
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Game Exchange Chatbot</title>
+        <link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {
                 margin: 0;
                 padding: 0;
                 min-height: 100vh;
@@ -504,68 +414,94 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
 
     <script>
-        function addMessage(type, text) {
-            const messagesDiv = document.getElementById('messages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${type}`;
-            messageDiv.textContent = text;
-            messagesDiv.appendChild(messageDiv);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
+         class GameExchangeChatbot {
+            constructor() {
+                this.messagesDiv = document.getElementById('messages');
+                this.optionsDiv = document.getElementById('options');
+                
+                // Event listener for initial load
+                document.addEventListener('DOMContentLoaded', () => this.sendMessage("Hello"));
+            }
 
-        function showOptions(options) {
-            const optionsDiv = document.getElementById('options');
-            optionsDiv.innerHTML = '';
+            // Add message to chat interface
+            addMessage(type, text) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${type}`;
+                messageDiv.textContent = text;
+                this.messagesDiv.appendChild(messageDiv);
+                this.scrollToBottom();
+            }
+
+            // Scroll messages to bottom
+            scrollToBottom() {
+                this.messagesDiv.scrollTop = this.messagesDiv.scrollHeight;
+            }
+
+            // Show interactive options
+            showOptions(options) {
+            this.optionsDiv.innerHTML = '';
             
             options.forEach(option => {
                 const button = document.createElement('button');
                 button.textContent = option;
                 button.onclick = () => {
-                    addMessage('user', option);
-                    optionsDiv.innerHTML = '';
-                    sendMessage(option, option);
+                    this.addMessage('user', option);
+                    this.optionsDiv.innerHTML = '';
+                    // Determine whether to send as 'action' or 'selectedGame'
+                    if (option === 'Borrow' || option === 'Exchange') {
+                        this.sendMessage(option); // Send 'option' as 'action'
+                    } else {
+                        this.sendMessage(null, option); // Send 'option' as 'selectedGame'
+                    }
                 };
-                optionsDiv.appendChild(button);
+                this.optionsDiv.appendChild(button);
             });
         }
 
-        function sendMessage(action, selectedGame = null) {
-            if (!action || (selectedGame && selectedGame.includes('99999'))) {
-                addMessage('bot', "Invalid selection. Please try again.");
-                return;
+            // Send message to server
+            sendMessage(action = null, selectedGame = null) {
+    if (!action && !selectedGame) {
+        this.addMessage('bot', "Invalid selection. Please try again.");
+        return;
+    }
+
+    fetch('', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            action,
+            selected_game: selectedGame
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.message) {
+            this.addMessage('bot', data.message);
+
+            // Highlight successful messages
+            if (data.message.includes('successfully')) {
+                const lastMessage = this.messagesDiv.lastElementChild;
+                lastMessage.classList.add('success');
+
+                // Auto-reset after successful action
+                setTimeout(() => this.sendMessage("Hello"), 2000);
             }
 
-            fetch('', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action,
-                    selected_game: selectedGame
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.message) {
-                    addMessage('bot', data.message);
-                    
-                    if (data.message.includes('successfully')) {
-                        const lastMessage = document.querySelector('.messages .message:last-child');
-                        lastMessage.classList.add('success');
-                        document.getElementById('options').innerHTML = '';
-                        setTimeout(() => sendMessage("Hello"), 2000);
-                    } else if (data.options && data.options.length > 0) {
-                        showOptions(data.options);
-                    }
-                }
-            })
-            .catch(() => {
-                addMessage('bot', "Error: An issue occurred. Please try again.");
-            });
+            // Show options if available
+            if (data.options && data.options.length > 0) {
+                this.showOptions(data.options);
+            }
         }
+    })
+    .catch(error => console.error('Error:', error));
+}
+         }
 
-        document.addEventListener('DOMContentLoaded', () => {
-            sendMessage("Hello");
-        });
+        // Initialize chatbot
+        const chatbot = new GameExchangeChatbot();
     </script>
 </body>
 </html>
+<?php
+}
+?>

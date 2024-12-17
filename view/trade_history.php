@@ -48,6 +48,7 @@ $history = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 <html>
 <head>
     <title>Trade History</title>
+    <link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
     <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
     <style>
     :root {
